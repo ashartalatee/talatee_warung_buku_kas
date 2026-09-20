@@ -234,21 +234,21 @@ export async function softDeleteTransaction(db: Db, row_id: string, deleted_by: 
   return { row_id, deleted: true };
 }
 
-export async function restoreTransaction(db: Db, row_id: string) {
+export async function restoreTransaction(db: Db, row_id: string, business_id: string) {
+  // Jaga ownership: hanya pemilik business yang bisa memulihkan transaksi miliknya
+  const exists = await db.get(
+    `SELECT row_id FROM transactions WHERE row_id = $1 AND business_id = $2 AND deleted_at IS NOT NULL`,
+    [row_id, business_id]
+  );
+  if (!exists) throw new LifecycleError("Transaksi tidak ada di Sampah (atau tidak ditemukan / bukan milik Anda).");
   const result = await db.run(
     `UPDATE transactions SET deleted_at = NULL, deleted_by = NULL WHERE row_id = $1 AND deleted_at IS NOT NULL`,
     [row_id]
   );
-  if (result.rowCount === 0) {
-    throw new LifecycleError("Transaksi tidak ada di Sampah (atau tidak ditemukan).");
-  }
+  if (result.rowCount === 0) throw new LifecycleError("Transaksi tidak ada di Sampah (atau tidak ditemukan).");
   return { row_id, deleted: false };
 }
 
-/** Hapus 1 batch upload ke Sampah -- source-nya DAN semua transaksi yang
- * berasal dari situ, sekaligus dalam 1 DB transaction (semua-atau-tidak-
- * sama-sekali, supaya tidak ada baris yang "setengah kehapus" kalau ada
- * error di tengah). */
 export async function softDeleteSource(db: Db, source_id: string, deleted_by: string) {
   const client = await db.connect();
   try {
@@ -336,13 +336,16 @@ export async function restoreSource(db: Db, source_id: string) {
  * (deleted_at IS NOT NULL) -- dijaga di sini, bukan cuma di lapisan API,
  * supaya fungsi ini sendiri tidak bisa "kebobolan" menghapus data yang
  * belum sempat lewat tahap Sampah. */
-export async function hardDeleteTransaction(db: Db, row_id: string) {
+export async function hardDeleteTransaction(db: Db, row_id: string, business_id: string) {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
 
-    const txn = await client.query(`SELECT row_id, deleted_at FROM transactions WHERE row_id = $1`, [row_id]);
-    if (txn.rowCount === 0) throw new LifecycleError("Transaksi tidak ditemukan.");
+    const txn = await client.query(
+      `SELECT row_id, deleted_at FROM transactions WHERE row_id = $1 AND business_id = $2`,
+      [row_id, business_id]
+    );
+    if (txn.rowCount === 0) throw new LifecycleError("Transaksi tidak ditemukan atau bukan milik Anda.");
     if (!txn.rows[0].deleted_at) {
       throw new DeletionBlockedError(
         "Transaksi ini belum ada di Sampah -- hapus ke Sampah dulu sebelum bisa dihapus permanen."
@@ -369,20 +372,26 @@ export async function hardDeleteTransaction(db: Db, row_id: string) {
 /** Hapus 1 batch upload PERMANEN -- source-nya DAN semua transaksi
  * turunannya. Sama seperti hardDeleteTransaction, WAJIB source-nya sudah
  * di Sampah dulu. */
-export async function hardDeleteSource(db: Db, source_id: string) {
+export async function hardDeleteSource(db: Db, source_id: string, business_id: string) {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
 
-    const src = await client.query(`SELECT source_id, deleted_at FROM sources WHERE source_id = $1`, [source_id]);
-    if (src.rowCount === 0) throw new LifecycleError("Batch upload tidak ditemukan.");
+    const src = await client.query(
+      `SELECT source_id, deleted_at FROM sources WHERE source_id = $1 AND business_id = $2`,
+      [source_id, business_id]
+    );
+    if (src.rowCount === 0) throw new LifecycleError("Batch upload tidak ditemukan atau bukan milik Anda.");
     if (!src.rows[0].deleted_at) {
       throw new DeletionBlockedError(
         "Batch upload ini belum ada di Sampah -- hapus ke Sampah dulu sebelum bisa dihapus permanen."
       );
     }
 
-    const rows = await client.query(`SELECT row_id FROM transactions WHERE source_id = $1`, [source_id]);
+    const rows = await client.query(`SELECT row_id FROM transactions WHERE source_id = $1 AND business_id = $2`, [
+      source_id,
+      business_id,
+    ]);
     for (const { row_id } of rows.rows as { row_id: string }[]) {
       await client.query(`DELETE FROM transaction_events WHERE from_row_id = $1 OR to_row_id = $1`, [row_id]);
       await client.query(`DELETE FROM duplicate_flags WHERE transaction_row_id = $1 OR candidate_row_id = $1`, [
@@ -390,8 +399,8 @@ export async function hardDeleteSource(db: Db, source_id: string) {
       ]);
       await client.query(`UPDATE transactions SET previous_row_id = NULL WHERE previous_row_id = $1`, [row_id]);
     }
-    await client.query(`DELETE FROM transactions WHERE source_id = $1`, [source_id]);
-    await client.query(`DELETE FROM sources WHERE source_id = $1`, [source_id]);
+    await client.query(`DELETE FROM transactions WHERE source_id = $1 AND business_id = $2`, [source_id, business_id]);
+    await client.query(`DELETE FROM sources WHERE source_id = $1 AND business_id = $2`, [source_id, business_id]);
 
     await client.query("COMMIT");
     return { source_id, permanently_deleted: true, affected_transactions: rows.rowCount };

@@ -6,13 +6,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hardDeleteSource, DeletionBlockedError, LifecycleError } from "@/lib/talatee-core/lifecycle";
 import { getDb } from "@/app/api/_lib/db";
+import { getCurrentUser } from "@/app/api/_lib/session";
 
 export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ sourceId: string }> }) {
   const { sourceId } = await params;
+  const user = await getCurrentUser();
   const db = getDb();
 
   try {
-    const result = await hardDeleteSource(db, sourceId);
+    const result = await hardDeleteSource(db, sourceId, user.business_id);
     return NextResponse.json(result);
   } catch (err) {
     if (err instanceof DeletionBlockedError) {
