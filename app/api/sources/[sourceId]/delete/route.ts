@@ -13,7 +13,7 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ so
   const db = getDb();
 
   try {
-    const result = await softDeleteSource(db, sourceId, user.user_identifier);
+    const result = await softDeleteSource(db, sourceId, user.business_id, user.user_identifier);
     return NextResponse.json(result);
   } catch (err) {
     if (err instanceof LifecycleError) {

@@ -19,6 +19,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ row
     const result = await resolveNeedsReview(
       db,
       rowId,
+      user.business_id,
       {
         total_amount: body.total_amount,
         transaction_date: body.transaction_date,

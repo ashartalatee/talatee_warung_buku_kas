@@ -17,7 +17,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ row
   const reason: CorrectionReason = body.reason ?? "Transaksi dibatalkan";
 
   try {
-    const result = await voidTransaction(db, rowId, reason, body.reason_detail ?? null, user.user_identifier);
+    const result = await voidTransaction(db, rowId, user.business_id, reason, body.reason_detail ?? null, user.user_identifier);
     return NextResponse.json(result);
   } catch (err) {
     if (err instanceof LifecycleError) {

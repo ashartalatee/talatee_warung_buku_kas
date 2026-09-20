@@ -10,10 +10,11 @@ export class LifecycleError extends Error {}
 export async function resolveNeedsReview(
   db: Db,
   row_id: string,
+  business_id: string,
   edits: { total_amount?: number; transaction_date?: string; transaction_time?: string },
   resolved_by: string
 ) {
-  const txn = await db.get(`SELECT * FROM transactions WHERE row_id = $1`, [row_id]);
+  const txn = await db.get(`SELECT * FROM transactions WHERE row_id = $1 AND business_id = $2`, [row_id, business_id]);
   if (!txn) throw new LifecycleError("Transaksi tidak ditemukan.");
   if ((txn as any).status !== "NEEDS_REVIEW") {
     throw new LifecycleError(
@@ -31,8 +32,8 @@ export async function resolveNeedsReview(
          validation_notes = NULL,
          resolved_by = $4,
          resolved_at = now()
-     WHERE row_id = $5`,
-    [edits.total_amount ?? null, edits.transaction_date ?? null, edits.transaction_time ?? null, resolved_by, row_id]
+     WHERE row_id = $5 AND business_id = $6`,
+    [edits.total_amount ?? null, edits.transaction_date ?? null, edits.transaction_time ?? null, resolved_by, row_id, business_id]
   );
 
   return { row_id, status: "ACTIVE" as const };
@@ -50,12 +51,13 @@ export async function resolveNeedsReview(
 export async function createCorrection(
   db: Db,
   row_id: string,
+  business_id: string,
   newValues: { total_amount: number },
   reason: CorrectionReason,
   reason_detail: string | null,
   corrected_by: string
 ) {
-  const txn = await db.get(`SELECT * FROM transactions WHERE row_id = $1`, [row_id]);
+  const txn = await db.get(`SELECT * FROM transactions WHERE row_id = $1 AND business_id = $2`, [row_id, business_id]);
   if (!txn) throw new LifecycleError("Transaksi tidak ditemukan.");
   const txnRow = txn as any;
   if (txnRow.status !== "ACTIVE") {
@@ -77,8 +79,8 @@ export async function createCorrection(
     // silently inserting a second ACTIVE version (uq_one_active_per_transaction
     // would also reject it, but we want a clear message before that).
     const info = await client.query(
-      `UPDATE transactions SET status = 'SUPERSEDED' WHERE row_id = $1 AND status = 'ACTIVE'`,
-      [row_id]
+      `UPDATE transactions SET status = 'SUPERSEDED' WHERE row_id = $1 AND business_id = $2 AND status = 'ACTIVE'`,
+      [row_id, business_id]
     );
     if (info.rowCount === 0) {
       throw new LifecycleError("Transaksi ini sudah diubah oleh proses lain. Silakan muat ulang dan coba lagi.");
@@ -129,11 +131,12 @@ export async function createCorrection(
 export async function voidTransaction(
   db: Db,
   row_id: string,
+  business_id: string,
   reason: CorrectionReason,
   reason_detail: string | null,
   performed_by: string
 ) {
-  const txn = await db.get(`SELECT * FROM transactions WHERE row_id = $1`, [row_id]);
+  const txn = await db.get(`SELECT * FROM transactions WHERE row_id = $1 AND business_id = $2`, [row_id, business_id]);
   if (!txn) throw new LifecycleError("Transaksi tidak ditemukan.");
   const txnRow = txn as any;
   if (txnRow.status !== "ACTIVE") {
@@ -144,9 +147,10 @@ export async function voidTransaction(
   try {
     await client.query("BEGIN");
 
-    const info = await client.query(`UPDATE transactions SET status = 'VOID' WHERE row_id = $1 AND status = 'ACTIVE'`, [
-      row_id,
-    ]);
+    const info = await client.query(
+      `UPDATE transactions SET status = 'VOID' WHERE row_id = $1 AND business_id = $2 AND status = 'ACTIVE'`,
+      [row_id, business_id]
+    );
     if (info.rowCount === 0) {
       throw new LifecycleError("Transaksi ini sudah diubah oleh proses lain. Muat ulang dan coba lagi.");
     }
@@ -222,13 +226,13 @@ export class DeletionBlockedError extends LifecycleError {}
 /** Hapus 1 transaksi ke Sampah (reversibel). Tidak peduli status-nya apa
  * (ACTIVE/NEEDS_REVIEW/VOID/SUPERSEDED) -- untuk keperluan bersih-bersih
  * data uji, semua boleh dibuang, bukan cuma yang ACTIVE. */
-export async function softDeleteTransaction(db: Db, row_id: string, deleted_by: string) {
+export async function softDeleteTransaction(db: Db, row_id: string, business_id: string, deleted_by: string) {
   const result = await db.run(
-    `UPDATE transactions SET deleted_at = now(), deleted_by = $2 WHERE row_id = $1 AND deleted_at IS NULL`,
-    [row_id, deleted_by]
+    `UPDATE transactions SET deleted_at = now(), deleted_by = $2 WHERE row_id = $1 AND business_id = $3 AND deleted_at IS NULL`,
+    [row_id, deleted_by, business_id]
   );
   if (result.rowCount === 0) {
-    const exists = await db.get(`SELECT row_id FROM transactions WHERE row_id = $1`, [row_id]);
+    const exists = await db.get(`SELECT row_id FROM transactions WHERE row_id = $1 AND business_id = $2`, [row_id, business_id]);
     throw new LifecycleError(exists ? "Transaksi ini sudah ada di Sampah." : "Transaksi tidak ditemukan.");
   }
   return { row_id, deleted: true };
@@ -242,34 +246,36 @@ export async function restoreTransaction(db: Db, row_id: string, business_id: st
   );
   if (!exists) throw new LifecycleError("Transaksi tidak ada di Sampah (atau tidak ditemukan / bukan milik Anda).");
   const result = await db.run(
-    `UPDATE transactions SET deleted_at = NULL, deleted_by = NULL WHERE row_id = $1 AND deleted_at IS NOT NULL`,
-    [row_id]
+    `UPDATE transactions SET deleted_at = NULL, deleted_by = NULL WHERE row_id = $1 AND business_id = $2 AND deleted_at IS NOT NULL`,
+    [row_id, business_id]
   );
   if (result.rowCount === 0) throw new LifecycleError("Transaksi tidak ada di Sampah (atau tidak ditemukan).");
   return { row_id, deleted: false };
 }
 
-export async function softDeleteSource(db: Db, source_id: string, deleted_by: string) {
+export async function softDeleteSource(db: Db, source_id: string, business_id: string, deleted_by: string) {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
 
-    const src = await client.query(`SELECT source_id FROM sources WHERE source_id = $1 AND deleted_at IS NULL`, [
+    const src = await client.query(`SELECT source_id FROM sources WHERE source_id = $1 AND business_id = $2 AND deleted_at IS NULL`, [
       source_id,
+      business_id,
     ]);
     if (src.rowCount === 0) {
       throw new LifecycleError("Batch upload ini tidak ditemukan (atau sudah ada di Sampah).");
     }
 
-    await client.query(`UPDATE sources SET deleted_at = now(), deleted_by = $2 WHERE source_id = $1`, [
+    await client.query(`UPDATE sources SET deleted_at = now(), deleted_by = $2 WHERE source_id = $1 AND business_id = $3`, [
       source_id,
       deleted_by,
+      business_id,
     ]);
     const txns = await client.query(
       `UPDATE transactions SET deleted_at = now(), deleted_by = $2
-         WHERE source_id = $1 AND deleted_at IS NULL
+         WHERE source_id = $1 AND business_id = $3 AND deleted_at IS NULL
          RETURNING row_id`,
-      [source_id, deleted_by]
+      [source_id, deleted_by, business_id]
     );
 
     await client.query("COMMIT");
@@ -289,24 +295,25 @@ export async function softDeleteSource(db: Db, source_id: string, deleted_by: st
  * disengaja -- sistem ini tidak mencatat "batch mana yang menyebabkan
  * baris ini kehapus", cuma "kapan". Untuk kebutuhan data uji/testing ini
  * cukup aman; kalau nanti butuh presisi per-aksi, perlu kolom tambahan. */
-export async function restoreSource(db: Db, source_id: string) {
+export async function restoreSource(db: Db, source_id: string, business_id: string) {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
 
-    const src = await client.query(`SELECT source_id FROM sources WHERE source_id = $1 AND deleted_at IS NOT NULL`, [
+    const src = await client.query(`SELECT source_id FROM sources WHERE source_id = $1 AND business_id = $2 AND deleted_at IS NOT NULL`, [
       source_id,
+      business_id,
     ]);
     if (src.rowCount === 0) {
       throw new LifecycleError("Batch upload ini tidak ada di Sampah (atau tidak ditemukan).");
     }
 
-    await client.query(`UPDATE sources SET deleted_at = NULL, deleted_by = NULL WHERE source_id = $1`, [source_id]);
+    await client.query(`UPDATE sources SET deleted_at = NULL, deleted_by = NULL WHERE source_id = $1 AND business_id = $2`, [source_id, business_id]);
     const txns = await client.query(
       `UPDATE transactions SET deleted_at = NULL, deleted_by = NULL
-         WHERE source_id = $1 AND deleted_at IS NOT NULL
+         WHERE source_id = $1 AND business_id = $2 AND deleted_at IS NOT NULL
          RETURNING row_id`,
-      [source_id]
+      [source_id, business_id]
     );
 
     await client.query("COMMIT");
@@ -357,7 +364,7 @@ export async function hardDeleteTransaction(db: Db, row_id: string, business_id:
       row_id,
     ]);
     await client.query(`UPDATE transactions SET previous_row_id = NULL WHERE previous_row_id = $1`, [row_id]);
-    await client.query(`DELETE FROM transactions WHERE row_id = $1`, [row_id]);
+    await client.query(`DELETE FROM transactions WHERE row_id = $1 AND business_id = $2`, [row_id, business_id]);
 
     await client.query("COMMIT");
     return { row_id, permanently_deleted: true };
