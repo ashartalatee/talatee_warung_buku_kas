@@ -83,7 +83,7 @@ async function main() {
 
   console.log("10. resolveNeedsReview...");
   const nrRow = needsReview[0];
-  const resolved = await resolveNeedsReview(db, nrRow.row_id, { total_amount: 10000 }, "tester");
+  const resolved = await resolveNeedsReview(db, nrRow.row_id, business_id, { total_amount: 10000 }, "tester");
   console.log("   OK:", resolved);
   if (resolved.status !== "ACTIVE") throw new Error("Harusnya jadi ACTIVE setelah resolve");
 
@@ -92,6 +92,7 @@ async function main() {
   const correction = await createCorrection(
     db,
     activeTxn.row_id,
+    business_id,
     { total_amount: beforeCorrection + 1000 },
     "Harga salah",
     null,
@@ -106,7 +107,7 @@ async function main() {
 
   console.log("12. Coba createCorrection LAGI di row LAMA yang sudah SUPERSEDED (harus ditolak 409-style)...");
   try {
-    await createCorrection(db, activeTxn.row_id, { total_amount: 99999 }, "Harga salah", null, "tester");
+    await createCorrection(db, activeTxn.row_id, business_id, { total_amount: 99999 }, "Harga salah", null, "tester");
     throw new Error("Harusnya gagal, tapi tidak!");
   } catch (err) {
     if (err instanceof Error && err.message.includes("ACTIVE")) {
@@ -119,7 +120,7 @@ async function main() {
   console.log("13. voidTransaction...");
   const anotherActive = txns.find((t) => t.status === "ACTIVE" && t.row_id !== activeTxn.row_id);
   if (anotherActive) {
-    const voided = await voidTransaction(db, anotherActive.row_id, "Transaksi dibatalkan", null, "tester");
+    const voided = await voidTransaction(db, anotherActive.row_id, business_id, "Transaksi dibatalkan", null, "tester");
     console.log("   OK:", voided);
   } else {
     console.log("   (skip, tidak ada transaksi ACTIVE lain untuk ditest)");

@@ -34,6 +34,7 @@ const FUTURE_DATE_PATTERN = /^Tanggal transaksi \(\d{4}-\d{2}-\d{2}\) ada di mas
 
 interface Candidate {
   row_id: string;
+  business_id: string;
   transaction_id: string;
   transaction_date: string;
   validation_notes: string | null;
@@ -52,7 +53,7 @@ async function main() {
   const todayLocal = getTodayLocalDate();
 
   const candidates = await db.all<Candidate>(
-    `SELECT row_id, transaction_id, transaction_date, validation_notes
+    `SELECT row_id, business_id, transaction_id, transaction_date, validation_notes
        FROM transactions
       WHERE status = 'NEEDS_REVIEW'
         AND validation_notes ILIKE '%ada di masa depan%'
@@ -112,7 +113,7 @@ async function main() {
 
   console.log(`\nMenerapkan perbaikan ke ${toFix.length} baris...`);
   for (const row of toFix) {
-    await resolveNeedsReview(db, row.row_id, {}, "system:fix-timezone-bug-2026-09-05");
+    await resolveNeedsReview(db, row.row_id, row.business_id, {}, "system:fix-timezone-bug-2026-09-05");
     console.log(`  OK  ${row.row_id}  (${row.transaction_date}) -> ACTIVE`);
   }
   console.log(`\nSelesai. ${toFix.length} baris dipindahkan dari NEEDS_REVIEW ke ACTIVE.`);
