@@ -6,13 +6,39 @@
 // untuk dipanggil manual dari browser lewat tombol di Settings, memakai
 // fungsi runBackup/listBackups yang SAMA PERSIS -- tidak ada logic baru.
 
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { runBackup, listBackups } from "@/lib/talatee-core/backup";
+import { getCurrentUser } from "@/app/api/_lib/session";
+import { PLATFORM_ADMIN_SESSION_ID, verifyLocalApiKey } from "@/app/api/_lib/auth";
 
 const BACKUP_DIR = process.env.BACKUP_DIR ?? "./backups";
 const RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS ?? "14");
 
-export async function GET() {
+async function isAuthorized(req: NextRequest): Promise<boolean> {
+  // 1. Cek header X-Api-Key jika dipanggil via mesin automasi
+  const apiKey = req.headers.get("x-api-key");
+  if (verifyLocalApiKey(apiKey)) {
+    return true;
+  }
+
+  // 2. Cek sesi Platform Admin
+  try {
+    const user = await getCurrentUser();
+    if (user.business_id === PLATFORM_ADMIN_SESSION_ID) {
+      return true;
+    }
+  } catch {
+    // Abaikan jika session tidak ada atau gagal
+  }
+
+  return false;
+}
+
+export async function GET(req: NextRequest) {
+  if (!(await isAuthorized(req))) {
+    return NextResponse.json({ error: "Hanya Platform Admin yang bisa akses ini." }, { status: 403 });
+  }
+
   try {
     const backups = listBackups(BACKUP_DIR);
     return NextResponse.json({ backups });
@@ -21,7 +47,11 @@ export async function GET() {
   }
 }
 
-export async function POST() {
+export async function POST(req: NextRequest) {
+  if (!(await isAuthorized(req))) {
+    return NextResponse.json({ error: "Hanya Platform Admin yang bisa akses ini." }, { status: 403 });
+  }
+
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
     return NextResponse.json({ error: "DATABASE_URL belum diisi di .env.local." }, { status: 500 });

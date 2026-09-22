@@ -26,7 +26,15 @@ async function recordFailure(db: ReturnType<typeof getDb>, identifier: string): 
     `INSERT INTO login_attempts (identifier, failed_count, updated_at)
      VALUES ($1, 1, now())
      ON CONFLICT (identifier) DO UPDATE
-       SET failed_count = login_attempts.failed_count + 1, updated_at = now()
+       SET failed_count = CASE
+             WHEN login_attempts.locked_until IS NOT NULL AND login_attempts.locked_until <= now() THEN 1
+             ELSE login_attempts.failed_count + 1
+           END,
+           locked_until = CASE
+             WHEN login_attempts.locked_until IS NOT NULL AND login_attempts.locked_until <= now() THEN NULL
+             ELSE login_attempts.locked_until
+           END,
+           updated_at = now()
      RETURNING failed_count`,
     [identifier]
   )) as { failed_count: number };
@@ -59,15 +67,9 @@ export async function POST(req: NextRequest) {
   }
 
   const db = getDb();
-  const identifier = body.business_id || PLATFORM_ADMIN_SESSION_ID;
 
-  const lockMessage = await checkLock(db, identifier);
-  if (lockMessage) {
-    return NextResponse.json({ error: lockMessage }, { status: 429 });
-  }
-
-  function issueSession(businessId: string, role: "platform" | "owner") {
-    const token = createSessionToken(businessId);
+  function issueSession(businessId: string, role: "platform" | "owner", tokenVersion: number) {
+    const token = createSessionToken(businessId, tokenVersion);
     const res = NextResponse.json({ ok: true, role });
     res.cookies.set(SESSION_COOKIE_NAME, token, {
       httpOnly: true,
@@ -79,35 +81,55 @@ export async function POST(req: NextRequest) {
     return res;
   }
 
+  // 1. Jalur Platform Admin: selalu gunakan kunci statis PLATFORM_ADMIN_SESSION_ID
+  // terlepas dari ada atau tidaknya business_id di request.
   const platformHash = process.env.PLATFORM_ADMIN_PASSWORD_HASH;
+  const adminLockMessage = await checkLock(db, PLATFORM_ADMIN_SESSION_ID);
+
   if (platformHash && verifyPassword(body.password, platformHash)) {
-    await recordSuccess(db, identifier);
-    return issueSession(PLATFORM_ADMIN_SESSION_ID, "platform");
+    if (adminLockMessage) {
+      return NextResponse.json({ error: adminLockMessage }, { status: 429 });
+    }
+    await recordSuccess(db, PLATFORM_ADMIN_SESSION_ID);
+    // Platform Admin tidak ada di DB -- token_version selalu 1 (tidak perlu rotasi per-device)
+    return issueSession(PLATFORM_ADMIN_SESSION_ID, "platform", 1);
   }
 
+  // 2. Jika tidak ada business_id di request, ini adalah percobaan login Platform Admin yang gagal
+  // (karena halaman /login tanpa ?biz= khusus untuk admin).
+  // Catat kegagalan ke kunci statis PLATFORM_ADMIN_SESSION_ID.
   if (!body.business_id) {
-    await recordFailure(db, identifier);
-    return NextResponse.json(
-      { error: "Link login tidak lengkap. Hubungi Talatee untuk link login yang benar." },
-      { status: 400 }
-    );
+    if (adminLockMessage) {
+      return NextResponse.json({ error: adminLockMessage }, { status: 429 });
+    }
+    await recordFailure(db, PLATFORM_ADMIN_SESSION_ID);
+    return NextResponse.json({ error: "Password salah." }, { status: 401 });
+  }
+
+  // 3. Jalur Klien Toko: gunakan business_id spesifik sebagai identifier rate-limiting.
+  // Kegagalan klien terisolasi dan tidak pernah mempengaruhi akun Platform Admin.
+  const clientIdentifier = body.business_id;
+  const clientLockMessage = await checkLock(db, clientIdentifier);
+  if (clientLockMessage) {
+    return NextResponse.json({ error: clientLockMessage }, { status: 429 });
   }
 
   const row = (await db.get(
-    `SELECT business_id, password_hash, is_active FROM businesses WHERE business_id = $1 AND password_hash IS NOT NULL`,
-    [body.business_id]
-  )) as { business_id: string; password_hash: string | null; is_active: boolean } | undefined;
+    `SELECT business_id, password_hash, is_active, token_version FROM businesses WHERE business_id = $1 AND password_hash IS NOT NULL`,
+    [clientIdentifier]
+  )) as { business_id: string; password_hash: string | null; is_active: boolean; token_version: number } | undefined;
 
   if (!row || !verifyPassword(body.password, row.password_hash)) {
-    await recordFailure(db, identifier);
+    await recordFailure(db, clientIdentifier);
     return NextResponse.json({ error: "Password salah." }, { status: 401 });
   }
 
   if (!row.is_active) {
-    await recordFailure(db, identifier);
+    await recordFailure(db, clientIdentifier);
     return NextResponse.json({ error: "Password salah." }, { status: 401 });
   }
 
-  await recordSuccess(db, identifier);
-  return issueSession(row.business_id, "owner");
+  await recordSuccess(db, clientIdentifier);
+  // Sertakan token_version dari DB agar sesi baru langsung cocok dengan versi terkini
+  return issueSession(row.business_id, "owner", row.token_version ?? 1);
 }

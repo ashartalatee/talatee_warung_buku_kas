@@ -20,7 +20,15 @@ CREATE TABLE IF NOT EXISTS businesses (
     business_type   TEXT NOT NULL CHECK (business_type IN ('warung', 'laundry', 'bengkel', 'marketplace')),
     is_active       BOOLEAN NOT NULL DEFAULT true,
     password_hash   TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- 22 Sept 2026 (token versioning): memungkinkan invalidasi sesi/link per-tenant
+    -- tanpa harus mengganti SESSION_SECRET global. Naikkan 1x -> semua token lama gugur.
+    --   token_version     : dinaikkan saat logout atau ganti password
+    --   share_key_version : dinaikkan saat pemilik toko merotasi link dashboard WA
+    -- Untuk DB yang sudah ada, jalankan: scripts/migrate-add-token-versions.ts
+    token_version       INTEGER NOT NULL DEFAULT 1,
+    share_key_version   INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS sources (

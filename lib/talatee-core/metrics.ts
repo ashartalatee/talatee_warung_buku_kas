@@ -123,23 +123,26 @@ export async function getPendingDuplicateFlags(db: Db, business_id: string) {
 }
 
 /** Full lineage: metric -> transaction -> line items -> source file. */
-export async function getLineage(db: Db, row_id: string) {
-  const txn = await db.get(`SELECT * FROM transactions WHERE row_id = $1`, [row_id]);
+export async function getLineage(db: Db, row_id: string, business_id: string) {
+  const txn = await db.get(`SELECT * FROM transactions WHERE row_id = $1 AND business_id = $2`, [row_id, business_id]);
+  if (!txn) {
+    return { transaction: undefined, lines: [], source: undefined };
+  }
   const lines = await db.all(`SELECT * FROM transaction_lines WHERE transaction_row_id = $1`, [row_id]);
   const source = await db.get(
-    `SELECT s.* FROM sources s JOIN transactions t ON t.source_id = s.source_id WHERE t.row_id = $1`,
-    [row_id]
+    `SELECT s.* FROM sources s JOIN transactions t ON t.source_id = s.source_id WHERE t.row_id = $1 AND t.business_id = $2`,
+    [row_id, business_id]
   );
   return { transaction: txn, lines, source };
 }
 
-export async function getVersionHistory(db: Db, transaction_id: string) {
+export async function getVersionHistory(db: Db, transaction_id: string, business_id: string) {
   return db.all(
     `SELECT version, status, total_amount, created_at, resolved_at
        FROM transactions
-       WHERE transaction_id = $1 AND deleted_at IS NULL
+       WHERE transaction_id = $1 AND business_id = $2 AND deleted_at IS NULL
        ORDER BY version ASC`,
-    [transaction_id]
+    [transaction_id, business_id]
   );
 }
 

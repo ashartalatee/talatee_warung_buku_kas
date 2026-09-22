@@ -132,7 +132,7 @@ async function main() {
 
   if (dupFlags.length > 0) {
     console.log("15. resolveDuplicateFlag...");
-    const resolvedFlag = await resolveDuplicateFlag(db, dupFlags[0].flag_id, "CONFIRMED_NEW", "tester");
+    const resolvedFlag = await resolveDuplicateFlag(db, dupFlags[0].flag_id, business_id, "CONFIRMED_NEW", "tester");
     console.log("   OK:", resolvedFlag);
   }
 

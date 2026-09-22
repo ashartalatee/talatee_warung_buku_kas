@@ -27,22 +27,55 @@ function sign(payload: string): string {
   return createHmac("sha256", getSecret()).update(payload).digest("hex");
 }
 
-/** Bikin token sesi baru untuk business_id tertentu, berlaku 30 hari. */
-export function createSessionToken(business_id: string): string {
+// =============================================================================
+// SESSION TOKEN
+//
+// Format lama (sebelum 22 Sept 2026): "<business_id>.<expires>.<sig>"
+// Format baru: "<business_id>.<token_version>.<expires>.<sig>"
+//   sig = HMAC("<business_id>.<token_version>.<expires>")
+//
+// Penambahan token_version memungkinkan invalidasi SEMUA sesi milik 1 tenant
+// hanya dengan menaikkan angka ini di DB — tanpa perlu mengganti SESSION_SECRET
+// global (yang akan merusak sesi semua tenant sekaligus). Ini dipakai:
+//   • saat logout          → token_version += 1 di DB
+//   • saat ganti password  → token_version += 1, lalu terbitkan cookie baru
+//     dengan versi terbaru (user langsung bisa pakai lagi di tab yang sama;
+//     sesi di device lain expire karena versinya sudah tertinggal)
+// =============================================================================
+
+/** Payload yang sudah terverifikasi dari cookie sesi. */
+export interface SessionTokenPayload {
+  business_id: string;
+  token_version: number;
+}
+
+/**
+ * Bikin token sesi baru untuk business_id tertentu, berlaku 30 hari.
+ * token_version HARUS diambil dari DB saat ini (kolom businesses.token_version);
+ * untuk Platform Admin (tidak ada di DB) selalu gunakan versi 1.
+ */
+export function createSessionToken(business_id: string, token_version: number): string {
   const expires = Date.now() + SESSION_MAX_AGE_SECONDS * 1000;
-  const payload = `${business_id}.${expires}`;
+  const payload = `${business_id}.${token_version}.${expires}`;
   const sig = sign(payload);
   return `${payload}.${sig}`;
 }
 
-/** Cek token dari cookie. Return business_id kalau valid, null kalau tidak. */
-export function verifySessionToken(token: string | undefined | null): string | null {
+/**
+ * Cek token dari cookie. Return { business_id, token_version } kalau
+ * tanda tangan & masa berlaku valid, null kalau tidak.
+ * CATATAN: fungsi ini hanya memverifikasi HMAC + expiry — pengecekan apakah
+ * token_version masih cocok dengan DB ada di proxy.ts (isValidSession),
+ * supaya route handler biasa tidak perlu tahu soal versioning.
+ */
+export function verifySessionToken(token: string | undefined | null): SessionTokenPayload | null {
   if (!token) return null;
   const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [business_id, expiresStr, sig] = parts;
+  // Format: uuid(tanpa titik) . number . number . hex64
+  if (parts.length !== 4) return null;
+  const [business_id, tokenVersionStr, expiresStr, sig] = parts;
 
-  const expected = sign(`${business_id}.${expiresStr}`);
+  const expected = sign(`${business_id}.${tokenVersionStr}.${expiresStr}`);
   const sigBuf = Buffer.from(sig);
   const expectedBuf = Buffer.from(expected);
   if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
@@ -54,7 +87,12 @@ export function verifySessionToken(token: string | undefined | null): string | n
     return null; // kedaluwarsa
   }
 
-  return business_id;
+  const token_version = Number(tokenVersionStr);
+  if (!Number.isInteger(token_version) || token_version < 1) {
+    return null; // format versi tidak valid
+  }
+
+  return { business_id, token_version };
 }
 
 export { SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS };
@@ -66,45 +104,67 @@ export { SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS };
  * n8n) supaya masing-masing bisa dirotasi sendiri-sendiri.
  */
 
-/**
- * 15 Sept 2026 -- diganti dari 1 DASHBOARD_SHARE_KEY global (env var) jadi
- * key per-business, supaya 1 deployment bisa layani banyak client sekaligus
- * (sebelumnya cuma 1 business bisa aktif per deployment). Key SEKARANG
- * membawa identitas business_id-nya sendiri lewat tanda tangan HMAC --
- * BUKAN disimpan di database -- konsisten dengan filosofi session token di
- * atas (createSessionToken/verifySessionToken): stateless, tidak perlu
- * query database buat verifikasi, sekaligus tidak bisa dipalsukan tanpa
- * tahu SESSION_SECRET.
- *
- * Format: "<business_id>.<signature>" -- signature = HMAC dari
- * "share:<business_id>", jadi 1 business_id SELALU menghasilkan share key
- * yang SAMA setiap kali (deterministik) -- cocok dipakai berulang di link
- * WA tanpa perlu simpan/generate ulang.
- */
-export function createShareKey(business_id: string): string {
-  const sig = sign(`share:${business_id}`);
-  return `${business_id}.${sig}`;
+// =============================================================================
+// SHARE KEY (link dashboard per-tenant yang dikirim lewat WA)
+//
+// Format lama (sebelum 22 Sept 2026): "<business_id>.<sig>"
+//   → deterministik, tidak bisa dicabut tanpa ganti SESSION_SECRET global.
+//
+// Format baru: "<business_id>.<share_key_version>.<sig>"
+//   sig = HMAC("share:<business_id>.<share_key_version>")
+//
+// Dengan adanya share_key_version, link lama LANGSUNG tidak valid begitu
+// pemilik toko menekan "Rotasi Link Dashboard" (POST /api/settings/rotate-share-key)
+// — tanpa memengaruhi sesi login maupun tenant lain.
+// Verifikasi versi membutuhkan 1 DB read di proxy.ts (isValidShareKey).
+// =============================================================================
+
+/** Payload yang sudah terverifikasi dari query-param ?key=. */
+export interface ShareKeyPayload {
+  business_id: string;
+  share_key_version: number;
 }
 
-/** Verifikasi ?key=... dari link dashboard, return business_id kalau valid,
- * null kalau tidak (rusak/dipalsukan). Dipakai proxy.ts (SHARE_LINK_ROUTES)
- * dan getCurrentUser() untuk tahu "ini dashboard milik business mana",
- * tanpa perlu cookie sesi maupun query database. */
-export function verifyShareKeyAndGetBusinessId(keyValue: string | null): string | null {
+/**
+ * Buat share key baru untuk business_id tertentu.
+ * share_key_version HARUS diambil dari DB saat ini (kolom businesses.share_key_version).
+ */
+export function createShareKey(business_id: string, share_key_version: number): string {
+  const sig = sign(`share:${business_id}.${share_key_version}`);
+  return `${business_id}.${share_key_version}.${sig}`;
+}
+
+/**
+ * Verifikasi ?key=... dari link dashboard.
+ * Return { business_id, share_key_version } kalau HMAC valid, null kalau tidak.
+ * Pengecekan apakah versi masih cocok dengan DB ada di proxy.ts (isValidShareKey).
+ */
+export function verifyShareKey(keyValue: string | null): ShareKeyPayload | null {
   if (!keyValue) return null;
-  const dotIndex = keyValue.indexOf(".");
-  if (dotIndex === -1) return null;
+  // Format: uuid . number . hex64  — ketiganya tidak mengandung titik
+  const parts = keyValue.split(".");
+  if (parts.length !== 3) return null;
+  const [business_id, versionStr, sig] = parts;
 
-  const business_id = keyValue.slice(0, dotIndex);
-  const sig = keyValue.slice(dotIndex + 1);
-  const expected = sign(`share:${business_id}`);
+  const version = Number(versionStr);
+  if (!Number.isInteger(version) || version < 1) return null;
 
+  const expected = sign(`share:${business_id}.${version}`);
   const sigBuf = Buffer.from(sig);
   const expectedBuf = Buffer.from(expected);
   if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
     return null;
   }
-  return business_id;
+  return { business_id, share_key_version: version };
+}
+
+/**
+ * @deprecated Gunakan verifyShareKey() yang baru.
+ * Alias ini hanya ada selama masa transisi — hapus setelah semua pemanggil
+ * sudah diperbarui.
+ */
+export function verifyShareKeyAndGetBusinessId(keyValue: string | null): string | null {
+  return verifyShareKey(keyValue)?.business_id ?? null;
 }
 
 export function verifyLocalApiKey(headerValue: string | null): boolean {

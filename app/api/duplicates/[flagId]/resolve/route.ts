@@ -27,7 +27,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ fla
   }
 
   try {
-    const result = await resolveDuplicateFlag(db, flagId, body.resolution, user.user_identifier);
+    const result = await resolveDuplicateFlag(db, flagId, user.business_id, body.resolution, user.user_identifier);
     return NextResponse.json(result);
   } catch (err) {
     if (err instanceof LifecycleError) {

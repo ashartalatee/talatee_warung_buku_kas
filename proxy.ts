@@ -17,7 +17,7 @@ import type { NextRequest } from "next/server";
 import {
   verifySessionToken,
   verifyLocalApiKey,
-  verifyShareKeyAndGetBusinessId,
+  verifyShareKey,
   SESSION_COOKIE_NAME,
   PLATFORM_ADMIN_SESSION_ID,
 } from "./app/api/_lib/auth";
@@ -37,13 +37,27 @@ const SHARE_LINK_ROUTES = ["/dashboard", "/api/reports/overview"];
 
 const PUBLIC_ROUTES = ["/login", "/api/login"];
 
-async function isBusinessActive(businessId: string): Promise<boolean> {
-  if (businessId === PLATFORM_ADMIN_SESSION_ID) return true;
+interface BusinessRecord {
+  is_active: boolean;
+  token_version: number;
+  share_key_version: number;
+}
+
+/**
+ * Ambil semua kolom validasi bisnis dalam 1 query.
+ * Return undefined kalau business_id tidak ditemukan.
+ * Platform Admin tidak ada di DB -- return rekaman "selalu valid" secara inline.
+ */
+async function getBusinessRecord(businessId: string): Promise<BusinessRecord | undefined> {
+  if (businessId === PLATFORM_ADMIN_SESSION_ID) {
+    return { is_active: true, token_version: 1, share_key_version: 1 };
+  }
   const db = getDb();
-  const row = (await db.get(`SELECT is_active FROM businesses WHERE business_id = $1`, [businessId])) as
-    | { is_active: boolean }
-    | undefined;
-  return !!row?.is_active;
+  return (await db.get(
+    `SELECT is_active, token_version, share_key_version
+       FROM businesses WHERE business_id = $1`,
+    [businessId]
+  )) as BusinessRecord | undefined;
 }
 
 function invalidShareLinkPage(): NextResponse {
@@ -115,8 +129,8 @@ export default async function proxy(request: NextRequest) {
 
   if (SHARE_LINK_ROUTES.some((p) => pathname === p)) {
     const key = request.nextUrl.searchParams.get("key");
-    const businessId = verifyShareKeyAndGetBusinessId(key);
-    if (!businessId) {
+    const sharePayload = verifyShareKey(key);
+    if (!sharePayload) {
       if (pathname.startsWith("/api/")) {
         return NextResponse.json(
           { error: "Link tidak valid atau kadaluarsa. Minta link terbaru lewat WhatsApp." },
@@ -125,11 +139,23 @@ export default async function proxy(request: NextRequest) {
       }
       return invalidShareLinkPage();
     }
-    if (!(await isBusinessActive(businessId))) {
+    const { business_id: shareBusinessId, share_key_version } = sharePayload;
+    const record = await getBusinessRecord(shareBusinessId);
+    if (!record || !record.is_active) {
       if (pathname.startsWith("/api/")) return jsonInactive();
       return invalidShareLinkPage();
     }
-    return nextWithBusinessId(request, businessId);
+    // Verifikasi versi share key: kalau tidak cocok, link ini sudah dirotasi
+    if (record.share_key_version !== share_key_version) {
+      if (pathname.startsWith("/api/")) {
+        return NextResponse.json(
+          { error: "Link dashboard sudah dirotasi. Minta link terbaru lewat WhatsApp." },
+          { status: 401 }
+        );
+      }
+      return invalidShareLinkPage();
+    }
+    return nextWithBusinessId(request, shareBusinessId);
   }
 
   if (N8N_ROUTES.some((p) => pathname === p)) {
@@ -146,10 +172,19 @@ export default async function proxy(request: NextRequest) {
     }
 
     const sessionCookie = request.cookies.get(SESSION_COOKIE_NAME)?.value;
-    const businessIdFromSession = verifySessionToken(sessionCookie);
-    if (businessIdFromSession) {
-      if (!(await isBusinessActive(businessIdFromSession))) return jsonInactive();
-      return nextWithBusinessId(request, businessIdFromSession);
+    const sessionPayload = verifySessionToken(sessionCookie);
+    if (sessionPayload) {
+      const { business_id: n8nBusinessId, token_version } = sessionPayload;
+      if (pathname === "/api/backup" && n8nBusinessId !== PLATFORM_ADMIN_SESSION_ID) {
+        return NextResponse.json({ error: "Hanya Platform Admin yang bisa akses backup." }, { status: 403 });
+      }
+      const record = await getBusinessRecord(n8nBusinessId);
+      if (!record || !record.is_active) return jsonInactive();
+      // Verifikasi versi token -- kalau sudah logout/ganti password, tolak
+      if (record.token_version !== token_version) {
+        return NextResponse.json({ error: "Sesi sudah tidak valid. Silakan login ulang." }, { status: 401 });
+      }
+      return nextWithBusinessId(request, n8nBusinessId);
     }
 
     return NextResponse.json(
@@ -162,9 +197,9 @@ export default async function proxy(request: NextRequest) {
   }
 
   const sessionCookie = request.cookies.get(SESSION_COOKIE_NAME)?.value;
-  const businessId = verifySessionToken(sessionCookie);
+  const sessionPayload = verifySessionToken(sessionCookie);
 
-  if (!businessId) {
+  if (!sessionPayload) {
     if (pathname.startsWith("/api/")) {
       return NextResponse.json({ error: "Belum login. Silakan login lagi." }, { status: 401 });
     }
@@ -172,13 +207,32 @@ export default async function proxy(request: NextRequest) {
     return NextResponse.redirect(loginUrl);
   }
 
-  if (!(await isBusinessActive(businessId))) {
+  const { business_id: businessId, token_version } = sessionPayload;
+  const record = await getBusinessRecord(businessId);
+
+  if (!record || !record.is_active) {
     if (pathname.startsWith("/api/")) return jsonInactive();
     return redirectInactive(request);
   }
 
+  // Verifikasi versi token -- sesi yang sudah di-revoke (logout/ganti password)
+  // punya versi lebih rendah dari DB, ditolak di sini sebelum sampai ke handler
+  if (record.token_version !== token_version) {
+    const loginUrl = new URL("/login", request.url);
+    loginUrl.searchParams.set("reason", "session_revoked");
+    const res = pathname.startsWith("/api/")
+      ? NextResponse.json({ error: "Sesi sudah tidak valid. Silakan login ulang." }, { status: 401 })
+      : NextResponse.redirect(loginUrl);
+    res.cookies.delete(SESSION_COOKIE_NAME); // bersihkan cookie lama yang sudah tidak valid
+    return res;
+  }
+
   if (pathname.startsWith("/ops") && businessId !== PLATFORM_ADMIN_SESSION_ID) {
     return NextResponse.redirect(new URL("/", request.url));
+  }
+
+  if (pathname.startsWith("/api/settings/backup") && businessId !== PLATFORM_ADMIN_SESSION_ID) {
+    return NextResponse.json({ error: "Hanya Platform Admin yang bisa akses backup." }, { status: 403 });
   }
 
   return nextWithBusinessId(request, businessId);

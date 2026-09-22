@@ -180,10 +180,11 @@ export async function voidTransaction(
 export async function resolveDuplicateFlag(
   db: Db,
   flag_id: string,
+  business_id: string,
   resolution: "CONFIRMED_DUPLICATE" | "CONFIRMED_NEW",
   resolved_by: string
 ) {
-  const flag = await db.get(`SELECT * FROM duplicate_flags WHERE flag_id = $1`, [flag_id]);
+  const flag = await db.get(`SELECT * FROM duplicate_flags WHERE flag_id = $1 AND business_id = $2`, [flag_id, business_id]);
   if (!flag) throw new LifecycleError("Duplicate flag tidak ditemukan.");
   if ((flag as any).resolution_status !== "PENDING") {
     throw new LifecycleError("Duplicate flag ini sudah diselesaikan sebelumnya.");
@@ -192,8 +193,8 @@ export async function resolveDuplicateFlag(
   await db.run(
     `UPDATE duplicate_flags
      SET resolution_status = $1, resolved_by = $2, resolved_at = now()
-     WHERE flag_id = $3`,
-    [resolution, resolved_by, flag_id]
+     WHERE flag_id = $3 AND business_id = $4`,
+    [resolution, resolved_by, flag_id, business_id]
   );
 
   return { flag_id, resolution_status: resolution };

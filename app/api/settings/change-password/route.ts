@@ -9,6 +9,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "../../_lib/session";
 import { getDb } from "../../_lib/db";
 import { hashPassword, verifyPassword } from "@/lib/talatee-core/password";
+import { createSessionToken, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS } from "../../_lib/auth";
 
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser();
@@ -37,7 +38,29 @@ export async function POST(req: NextRequest) {
   }
 
   const newHash = hashPassword(body.new_password);
-  await db.run(`UPDATE businesses SET password_hash = $1 WHERE business_id = $2`, [newHash, user.business_id]);
+  // Ubah password DAN naikkan token_version dalam 1 query atomik.
+  // Efeknya: semua sesi lain (device lain) langsung ditolak oleh proxy.ts
+  // karena token_version di cookie mereka sudah tertinggal.
+  const updated = (await db.get(
+    `UPDATE businesses
+        SET password_hash = $1,
+            token_version = token_version + 1
+      WHERE business_id = $2
+  RETURNING token_version`,
+    [newHash, user.business_id]
+  )) as { token_version: number } | undefined;
 
-  return NextResponse.json({ ok: true });
+  // Terbitkan cookie baru dengan versi terkini supaya user yang baru saja
+  // ganti password TIDAK ikut ter-kick -- dia langsung dapat sesi valid.
+  const newVersion = updated?.token_version ?? 1;
+  const newToken = createSessionToken(user.business_id, newVersion);
+  const res = NextResponse.json({ ok: true });
+  res.cookies.set(SESSION_COOKIE_NAME, newToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: SESSION_MAX_AGE_SECONDS,
+    path: "/",
+  });
+  return res;
 }
